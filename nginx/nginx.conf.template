@@ -1,0 +1,64 @@
+# nginx configuration template — processed by envsubst at container start.
+#
+# ${FQDN}  → replaced with the Azure FQDN from .env  (e.g. garmin-vm.westeurope.cloudapp.azure.com)
+# $$host   → becomes $host  at runtime  (nginx variable — $$ escapes envsubst)
+# $$scheme → becomes $scheme at runtime
+# etc.
+
+# ── HTTP — ACME challenge + redirect ──────────────────────────────────────────
+server {
+    listen 80;
+    server_name ${FQDN};
+
+    # Let's Encrypt webroot challenge (used for certificate renewal).
+    # Initial certificate uses --standalone (nginx not yet running), see deployment guide.
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+        try_files $$uri =404;
+    }
+
+    # Redirect all other HTTP traffic to HTTPS
+    location / {
+        return 301 https://$$host$$request_uri;
+    }
+}
+
+# ── HTTPS — reverse proxy to n8n ──────────────────────────────────────────────
+server {
+    listen 443 ssl;
+    server_name ${FQDN};
+
+    # TLS certificate (issued by certbot --standalone before first docker compose up)
+    ssl_certificate     /etc/letsencrypt/live/${FQDN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${FQDN}/privkey.pem;
+
+    # Modern TLS settings
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    # n8n: UI (port 5678) + Telegram webhooks + API
+    location / {
+        proxy_pass         http://n8n:5678;
+        proxy_http_version 1.1;
+
+        # WebSocket support (n8n UI uses SSE/WS)
+        proxy_set_header Upgrade    $$http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_set_header Host               $$host;
+        proxy_set_header X-Real-IP          $$remote_addr;
+        proxy_set_header X-Forwarded-For    $$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto  $$scheme;
+        proxy_cache_bypass                  $$http_upgrade;
+
+        # Allow large CSV uploads; generous timeouts for Claude API calls
+        client_max_body_size 50M;
+        proxy_read_timeout   300s;
+        proxy_send_timeout   300s;
+        proxy_connect_timeout 10s;
+    }
+}

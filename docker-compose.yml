@@ -1,0 +1,126 @@
+version: '3.8'
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Garmin Dashboard — Azure VM stack
+#
+# Services:
+#   nginx     — SSL termination (Let's Encrypt), reverse proxy → n8n
+#   n8n       — workflow orchestrator (Telegram webhook → analyzer → Telegram)
+#   analyzer  — Python FastAPI: Claude API + PostgreSQL writes
+#   postgres  — activity data store
+#
+# Security note on port 5432:
+#   Published on 0.0.0.0 so Tailscale peers (Power BI) can reach it.
+#   Docker bypasses ufw — the Azure NSG is the only external guard.
+#   REQUIRED: add an NSG Inbound rule: deny TCP 5432 from Internet.
+#   Tailscale traffic is tunnelled through UDP 41641 and is unaffected.
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Nginx ─────────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Template processed by envsubst at container start (nginx:alpine native feature).
+      # ${FQDN} → actual FQDN. Nginx vars ($host etc.) use $$ in template → $ at runtime.
+      - ./nginx/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      # Certbot webroot for renewal (initial cert uses --standalone, see README)
+      - ./nginx/certbot-webroot:/var/www/certbot
+    environment:
+      - FQDN=${FQDN}
+    depends_on:
+      - n8n
+      - analyzer
+    restart: unless-stopped
+    networks:
+      - garmin-net
+
+  # ── n8n ───────────────────────────────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:latest
+    expose:
+      - "5678"
+    environment:
+      # UI authentication
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASS}
+      # Encryption key for stored credentials (generate: openssl rand -hex 32)
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      # Webhook base URL — Telegram will POST here
+      - WEBHOOK_URL=https://${FQDN}
+      - GENERIC_TIMEZONE=Asia/Jerusalem
+      # n8n uses PostgreSQL as its own data store (workflows, executions, creds)
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      # Expose Telegram token so workflow nodes can reference it via $env.*
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - garmin-net
+
+  # ── Python Analyzer (FastAPI) ──────────────────────────────────────────────
+  analyzer:
+    build:
+      context: .           # Project root — allows COPY of garmin_analyzer.py etc.
+      dockerfile: api/Dockerfile
+    expose:
+      - "8000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    restart: unless-stopped
+    networks:
+      - garmin-net
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # init.sql runs once on first start (creates activities table + indexes)
+      - ./db/init.sql:/docker-entrypoint-initdb.d/10_init.sql:ro
+    ports:
+      # 0.0.0.0 required for Tailscale access — see top-of-file security note.
+      # Block this in Azure NSG: Inbound deny TCP 5432 from Internet.
+      - "0.0.0.0:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - garmin-net
+
+volumes:
+  n8n_data:
+  postgres_data:
+
+networks:
+  garmin-net:
+    driver: bridge

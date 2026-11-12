@@ -1,0 +1,209 @@
+{
+  "name": "Garmin CSV → PostgreSQL (webhook)",
+  "nodes": [
+
+    {
+      "parameters": {
+        "updates": ["message"],
+        "additionalFields": {}
+      },
+      "id": "node-1",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300],
+      "webhookId": "garmin-telegram-webhook",
+      "credentials": {
+        "telegramApi": {
+          "id": "telegram-cred",
+          "name": "Telegram Bot"
+        }
+      },
+      "notes": "Webhook mode. When workflow activates, n8n auto-registers the webhook URL with Telegram. Create a 'Telegram Bot' credential in n8n with TELEGRAM_BOT_TOKEN."
+    },
+
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ ($json.message?.document?.file_name ?? '').toLowerCase() }}",
+              "operation": "endsWith",
+              "value2": ".csv"
+            }
+          ]
+        }
+      },
+      "id": "node-2",
+      "name": "IF: Is CSV?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+
+    {
+      "parameters": {
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/getFile",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "file_id",
+              "value": "={{ $('Telegram Trigger').first().json.message.document.file_id }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-3",
+      "name": "HTTP: getFile",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [680, 180]
+    },
+
+    {
+      "parameters": {
+        "url": "=https://api.telegram.org/file/bot{{ $env.TELEGRAM_BOT_TOKEN }}/{{ $json.result.file_path }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "node-4",
+      "name": "HTTP: Download CSV",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [900, 180],
+      "notes": "Downloads file content as plain text. Garmin files are UTF-8 (sometimes with BOM — the Python analyzer handles utf-8-sig decoding)."
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://analyzer:8000/process",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ csv_content: $json.data }) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "node-5",
+      "name": "HTTP: Analyze + Save",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1120, 180],
+      "notes": "Calls the internal FastAPI microservice. analyzer:8000 is reachable within the Docker network. Timeout 120s for large CSV + Claude API latency."
+    },
+
+    {
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\n\nconst breakdown = Object.entries(r.activity_breakdown || {})\n  .map(([type, count]) => `  • ${type}: ${count}`)\n  .join('\\n');\n\nconst hrLine = r.avg_heart_rate\n  ? `💓 דופק ממוצע: ${r.avg_heart_rate} bpm\\n`\n  : '';\n\nconst dedupNote = r.inserted === 0\n  ? '\\n\\nℹ️ כל האימונים כבר קיימים (אין כפילויות).'\n  : '';\n\nconst message = [\n  `✅ הושלם! נוספו ${r.inserted} אימונים חדשים ל-DB.`,\n  '',\n  '📊 סיכום:',\n  `🏃 אימונים בקובץ: ${r.activities_found}`,\n  `📍 מרחק כולל: ${(r.total_distance_km || 0).toFixed(1)} ק\"מ`,\n  hrLine.trim(),\n  `🔥 קלוריות: ${(r.total_calories || 0).toLocaleString()}`,\n  breakdown ? `\\nסוגי אימון:\\n${breakdown}` : '',\n  dedupNote,\n].filter(Boolean).join('\\n');\n\nreturn [{ json: {\n  chat_id: $('Telegram Trigger').first().json.message.chat.id,\n  text: message\n}}];"
+      },
+      "id": "node-6",
+      "name": "Code: Build Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 180]
+    },
+
+    {
+      "parameters": {
+        "resource": "message",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {}
+      },
+      "id": "node-7",
+      "name": "Telegram: Confirm",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1560, 180],
+      "credentials": {
+        "telegramApi": {
+          "id": "telegram-cred",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+
+    {
+      "parameters": {
+        "resource": "message",
+        "chatId": "={{ $json.message.chat.id }}",
+        "text": "⚠️ שלח קובץ CSV בלבד (ייצוא מ-Garmin Connect).",
+        "additionalFields": {}
+      },
+      "id": "node-8",
+      "name": "Telegram: Reject",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [680, 440],
+      "credentials": {
+        "telegramApi": {
+          "id": "telegram-cred",
+          "name": "Telegram Bot"
+        }
+      }
+    }
+
+  ],
+
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [{ "node": "IF: Is CSV?", "type": "main", "index": 0 }]
+      ]
+    },
+    "IF: Is CSV?": {
+      "main": [
+        [{ "node": "HTTP: getFile",    "type": "main", "index": 0 }],
+        [{ "node": "Telegram: Reject", "type": "main", "index": 0 }]
+      ]
+    },
+    "HTTP: getFile": {
+      "main": [
+        [{ "node": "HTTP: Download CSV", "type": "main", "index": 0 }]
+      ]
+    },
+    "HTTP: Download CSV": {
+      "main": [
+        [{ "node": "HTTP: Analyze + Save", "type": "main", "index": 0 }]
+      ]
+    },
+    "HTTP: Analyze + Save": {
+      "main": [
+        [{ "node": "Code: Build Message", "type": "main", "index": 0 }]
+      ]
+    },
+    "Code: Build Message": {
+      "main": [
+        [{ "node": "Telegram: Confirm", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "tags": [],
+  "meta": {
+    "notes": "Prerequisites: (1) Create 'Telegram Bot' credential in n8n with your bot token. (2) TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be in n8n container environment (docker-compose.yml already sets them). (3) Activate workflow — n8n auto-registers the Telegram webhook. (4) Analyzer service must be running: docker compose up analyzer."
+  }
+}
